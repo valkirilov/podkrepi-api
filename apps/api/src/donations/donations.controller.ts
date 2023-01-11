@@ -1,5 +1,4 @@
-import { RealmViewSupporters, ViewSupporters } from '@podkrepi-bg/podkrepi-types'
-import { AuthenticatedUser, Public, RoleMatchingMode, Roles } from 'nest-keycloak-connect'
+import { Response } from 'express'
 import {
   Body,
   Controller,
@@ -9,20 +8,21 @@ import {
   Post,
   UnauthorizedException,
   Query,
+  Logger,
   Res,
 } from '@nestjs/common'
-import { ApiQuery } from '@nestjs/swagger'
-import { Response } from 'express'
-
+import { ApiQuery, ApiTags } from '@nestjs/swagger'
+import { AuthenticatedUser, Public, RoleMatchingMode, Roles } from 'nest-keycloak-connect'
+import { RealmViewSupporters, ViewSupporters } from '@podkrepi-bg/podkrepi-types'
 import { isAdmin, KeycloakTokenParsed } from '../auth/keycloak'
 import { DonationsService } from './donations.service'
 import { CreateSessionDto } from './dto/create-session.dto'
 import { CreatePaymentDto } from './dto/create-payment.dto'
 import { UpdatePaymentDto } from './dto/update-payment.dto'
 import { CreateBankPaymentDto } from './dto/create-bank-payment.dto'
-import { DonationStatus } from '@prisma/client'
-import { PagingQueryDto } from '../common/dto/paging-query-dto'
-import { ApiTags } from '@nestjs/swagger'
+import { DonationStatus, DonationType } from '@prisma/client'
+import { CreatePaymentIntentDto } from './dto/create-payment-intent.dto'
+import { DonationQueryDto } from '../common/dto/donation-query-dto'
 
 @ApiTags('donation')
 @Controller('donation')
@@ -42,7 +42,20 @@ export class DonationsController {
 
   @Post('create-checkout-session')
   @Public()
-  createCheckoutSession(@Body() sessionDto: CreateSessionDto) {
+  async createCheckoutSession(@Body() sessionDto: CreateSessionDto) {
+    if (sessionDto.mode === 'subscription' && (sessionDto.personId === null || sessionDto.personId.length === 0)) {
+      // in case of a intermediate (step 2) login, we might end up with no personId
+      // not able to fetch the current logged user here (due to @Public())
+      sessionDto.personId = await this.donationsService.getUserId(sessionDto.personEmail)
+    }
+
+    if (sessionDto.mode == 'subscription' && (sessionDto.personId == null || sessionDto.personId.length == 0)) {
+      Logger.error(`No personId found for email ${sessionDto.personEmail}. Unable to create a checkout session for a recurring donation`)
+      throw new UnauthorizedException("You must be logged in to create a recurring donation")
+    }
+
+    Logger.debug(`Creating checkout session with data ${JSON.stringify(sessionDto)}`)
+
     return this.donationsService.createCheckoutSession(sessionDto)
   }
 
@@ -78,7 +91,7 @@ export class DonationsController {
   findAllPublic(
     @Query('campaignId') campaignId?: string,
     @Query('status') status?: DonationStatus,
-    @Query() query?: PagingQueryDto,
+    @Query() query?: DonationQueryDto,
   ) {
     return this.donationsService.listDonationsPublic(
       campaignId,
@@ -94,17 +107,21 @@ export class DonationsController {
     mode: RoleMatchingMode.ANY,
   })
   @ApiQuery({ name: 'campaignId', required: false, type: String })
-  @ApiQuery({ name: 'status', required: false, enum: DonationStatus })
+  @ApiQuery({ name: 'status', required: false })
+  @ApiQuery({ name: 'type', required: false })
   @ApiQuery({ name: 'pageindex', required: false, type: Number })
   @ApiQuery({ name: 'pagesize', required: false, type: Number })
-  findAll(
-    @Query('campaignId') campaignId?: string,
-    @Query('status') status?: DonationStatus,
-    @Query() query?: PagingQueryDto,
-  ) {
+  @ApiQuery({ name: 'from', required: false, type: Date })
+  @ApiQuery({ name: 'to', required: false, type: Date })
+  @ApiQuery({ name: 'search', required: false, type: String })
+  findAll(@Query() query?: DonationQueryDto) {
     return this.donationsService.listDonations(
-      campaignId,
-      status,
+      query?.campaignId,
+      query?.status,
+      query?.type,
+      query?.from,
+      query?.to,
+      query?.search,
       query?.pageindex,
       query?.pagesize,
     )
@@ -133,6 +150,15 @@ export class DonationsController {
     }
 
     return this.donationsService.create(createPaymentDto, user)
+  }
+
+  @Post('create-payment-intent')
+  @Public()
+  createPaymentIntent(
+    @Body()
+    createPaymentIntentDto: CreatePaymentIntentDto,
+  ) {
+    return this.donationsService.createPaymentIntent(createPaymentIntentDto)
   }
 
   @Post('create-bank-payment')

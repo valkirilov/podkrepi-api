@@ -40,8 +40,8 @@ export class DonationsService {
   ) {}
 
   async listPrices(type?: Stripe.PriceListParams.Type, active?: boolean): Promise<Stripe.Price[]> {
-    const list = await this.stripeClient.prices.list({ active, type })
-    return list.data
+    const list = await this.stripeClient.prices.list({ active, type, limit: 100 })
+    return list.data.filter((price) => price.active)
   }
 
   /**
@@ -80,7 +80,7 @@ export class DonationsService {
         status: DonationStatus.initial,
         extCustomerId: sessionDto.personEmail ?? '',
         extPaymentIntentId: paymentIntentId,
-        extPaymentMethodId: 'card',
+        extPaymentMethodId: sessionDto.mode === 'subscription' ? 'subscription' : 'card',
         billingEmail: sessionDto.isAnonymous ? sessionDto.personEmail : null, //set the personal mail to billing which is not public field
         targetVault: targetVaultData,
       },
@@ -120,38 +120,65 @@ export class DonationsService {
     const campaign = await this.campaignService.validateCampaignId(sessionDto.campaignId)
     const { mode } = sessionDto
     const appUrl = this.config.get<string>('APP_URL')
-    const metadata: DonationMetadata = { campaignId: sessionDto.campaignId }
+    const metadata: DonationMetadata = {
+      campaignId: sessionDto.campaignId,
+      personId: sessionDto.personId,
+    }
 
-    const session = await this.stripeClient.checkout.sessions.create({
+    const items = await this.prepareSessionItems(sessionDto, campaign)
+
+    const createSessionRequest: Stripe.Checkout.SessionCreateParams = {
       mode,
       customer_email: sessionDto.personEmail,
-      line_items: this.prepareSessionItems(sessionDto, campaign),
+      line_items: items,
       payment_method_types: ['card'],
-      payment_intent_data: mode === 'payment' ? { metadata } : undefined,
-      subscription_data: mode === 'subscription' ? { metadata } : undefined,
+      payment_intent_data: mode == 'payment' ? { metadata } : undefined,
+      subscription_data: mode == 'subscription' ? { metadata } : undefined,
       success_url: sessionDto.successUrl ?? `${appUrl}/success`,
       cancel_url: sessionDto.cancelUrl ?? `${appUrl}/canceled`,
       tax_id_collection: { enabled: true },
+    }
+
+    Logger.debug('[ CreateCheckoutSession ]', createSessionRequest)
+
+    const session = await this.stripeClient.checkout.sessions.create(createSessionRequest)
+
+    Logger.log('[ CreateInitialDonation ]', {
+      session: session,
     })
 
-    await this.createInitialDonation(campaign, sessionDto, session.payment_intent as string)
+    await this.createInitialDonation(
+      campaign,
+      sessionDto,
+      (session.payment_intent as string) ?? session.id,
+    )
 
     return { session }
   }
 
-  private prepareSessionItems(
+  private async prepareSessionItems(
     sessionDto: CreateSessionDto,
     campaign: Campaign,
-  ): Stripe.Checkout.SessionCreateParams.LineItem[] {
-    // Use priceId if provided
-    if (sessionDto.priceId) {
-      return [
-        {
-          price: sessionDto.priceId,
-          quantity: 1,
+  ): Promise<Stripe.Checkout.SessionCreateParams.LineItem[]> {
+    if (sessionDto.mode == 'subscription') {
+      //use an inline price for subscriptions
+      const stripeItem = {
+        price_data: {
+          currency: campaign.currency,
+          unit_amount: sessionDto.amount,
+          recurring: {
+            interval: 'month' as Stripe.Price.Recurring.Interval,
+            interval_count: 1,
+          },
+          product_data: {
+            name: campaign.title,
+          },
         },
-      ]
+        quantity: 1,
+      }
+      return [stripeItem]
     }
+
     // Create donation with custom amount
     return [
       {
@@ -169,6 +196,7 @@ export class DonationsService {
    * @param status (Optional) Filter by campaign status
    * @param pageIndex (Optional)
    * @param pageSize (Optional)
+   * @param type (Optional) Filter by type
    */
   async listDonationsPublic(
     campaignId?: string,
@@ -210,24 +238,84 @@ export class DonationsService {
    * Lists all donations with all fields only for admin roles
    * @param campaignId (Optional) Filter by campaign id
    * @param status (Optional) Filter by campaign status
+   * @param type (Optional) Filter by donation type
+   * @param from (Optional) Filter by creation date
+   * @param to (Optional) Filter by creation date
+   * @param search (Optional) Search by name or email
    * @param pageIndex (Optional)
    * @param pageSize (Optional)
    */
   async listDonations(
     campaignId?: string,
     status?: DonationStatus,
+    type?: DonationType,
+    from?: Date,
+    to?: Date,
+    search?: string,
     pageIndex?: number,
     pageSize?: number,
   ): Promise<ListDonationsDto<DonationWithPerson>> {
     const data = await this.prisma.donation.findMany({
-      where: { status, targetVault: { campaign: { id: campaignId } } },
+      where: {
+        status,
+        type,
+        createdAt: {
+          gte: from,
+          lte: to,
+        },
+        ...(search && {
+          OR: [
+            { billingName: { contains: search } },
+            { billingEmail: { contains: search } },
+            {
+              person: {
+                OR: [
+                  {
+                    firstName: { contains: search },
+                  },
+                  {
+                    lastName: { contains: search },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        targetVault: { campaign: { id: campaignId } },
+      },
       skip: pageIndex && pageSize ? pageIndex * pageSize : undefined,
       take: pageSize ? pageSize : undefined,
       ...donationWithPerson,
     })
 
     const count = await this.prisma.donation.count({
-      where: { status, targetVault: { campaign: { id: campaignId } } },
+      where: {
+        status,
+        type,
+        createdAt: {
+          gte: from,
+          lte: to,
+        },
+        ...(search && {
+          OR: [
+            { billingName: { contains: search } },
+            { billingEmail: { contains: search } },
+            {
+              person: {
+                OR: [
+                  {
+                    firstName: { contains: search },
+                  },
+                  {
+                    lastName: { contains: search },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        targetVault: { campaign: { id: campaignId } },
+      },
     })
 
     const result = {
@@ -237,6 +325,12 @@ export class DonationsService {
     return result
   }
 
+  /**
+   *  Get donation by id
+   * @param id Donation id
+   * @returns  {Promise<Donation>} Donation
+   * @throws NotFoundException if no donation is found
+   */
   async getDonationById(id: string): Promise<Donation> {
     try {
       const donation = await this.prisma.donation.findFirst({
@@ -251,6 +345,12 @@ export class DonationsService {
     }
   }
 
+  /**
+   * Get donation by id with person data attached
+   * @param id Donation id
+   * @param keycloakId Keycloak id of the user
+   * @returns {Promise<Donation & { person: Person | null }>} Donation
+   */
   async getUserDonationById(
     id: string,
     keycloakId: string,
@@ -281,6 +381,12 @@ export class DonationsService {
     })
   }
 
+  /** Describe the function below
+   * @param inputDto
+   * @param user
+   * @returns {Promise<Donation>}
+   *
+   */
   async create(inputDto: CreatePaymentDto, user: KeycloakTokenParsed): Promise<Donation> {
     const donation = await this.prisma.donation.create({ data: inputDto.toEntity(user) })
 
@@ -289,6 +395,17 @@ export class DonationsService {
     }
 
     return donation
+  }
+
+  /**
+   * Create a payment intent for a donation
+   * @param inputDto Payment intent create params
+   * @returns {Promise<Stripe.Response<Stripe.PaymentIntent>>}
+   */
+  async createPaymentIntent(
+    inputDto: Stripe.PaymentIntentCreateParams,
+  ): Promise<Stripe.Response<Stripe.PaymentIntent>> {
+    return this.stripeClient.paymentIntents.create(inputDto)
   }
 
   /**
@@ -435,6 +552,22 @@ export class DonationsService {
     })
   }
 
+  async getUserId(email: string): Promise<string | null> {
+    const user = await this.prisma.person.findFirst({
+      where: { email },
+      select: { id: true },
+    })
+
+    if (!user) {
+      return null
+    }
+
+    return user.id
+  }
+
+  /**
+   *  @param res  - Response object to be used for the export to excel file
+   */
   async exportToExcel(res: Response) {
     const { items } = await this.listDonations()
     const donationsMappedForExport = items.map((donation) => ({
